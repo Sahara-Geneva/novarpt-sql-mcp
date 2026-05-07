@@ -1,10 +1,11 @@
 FROM node:20-alpine
 
 WORKDIR /app
-COPY package.json .
+
+COPY package.json package-lock.json ./
 RUN npm ci --only=production
 
-COPY server.js .
+COPY . .
 EXPOSE 8080
 
 CMD ["npm", "start"]
