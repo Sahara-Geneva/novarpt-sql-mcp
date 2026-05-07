@@ -1,50 +1,120 @@
 const express = require('express');
-const cors = require('cors');
-const { spawn } = require('child_process');
+const sql = require('tedious');
+const {
+  McpServer
+} = require('@modelcontextprotocol/sdk/server/mcp.js');
+const {
+  StreamableHTTPServerTransport
+} = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json());
 
-const PORT = process.env.PORT || 8080;
-
-// Endpoint MCP principal
-app.all('/mcp/*', async (req, res) => {
-  const mcpProcess = spawn('npx', ['@bilims/mcp-sqlserver'], {
-    env: {
-      ...process.env,
-      SQLSERVER_HOST: process.env.SQLSERVER_HOST || 'Srvgva1-NOVARPT\\NOVAPNL',
-      SQLSERVER_USER: process.env.SQLSERVER_USER || 'NovaClaude',
-      SQLSERVER_PASSWORD: process.env.SQLSERVER_PASSWORD || 'pNc3%SAH45',
-      SQLSERVER_DATABASE: process.env.SQLSERVER_DATABASE || 'Nova_Warehouse',
-      SQLSERVER_ENCRYPT: 'true',
-      SQLSERVER_TRUST_SERVER_CERTIFICATE: 'true'
-    },
-    stdio: ['pipe', 'pipe', 'pipe']
-  });
-
-  let requestBody = '';
-  req.on('data', chunk => requestBody += chunk);
-  
-  mcpProcess.stdin.write(requestBody + '\n');
-  mcpProcess.stdout.pipe(res);
-  
-  mcpProcess.stderr.on('data', data => {
-    console.error('MCP Error:', data.toString());
-    res.status(500).send('MCP Error');
-  });
+const server = new McpServer({
+  name: 'novarpt-sql-mcp',
+  version: '1.0.0'
 });
 
-// Health check
+function runQuery(query) {
+  return new Promise((resolve, reject) => {
+    const config = {
+      server: process.env.SQLSERVER_HOST,
+      authentication: {
+        type: 'default',
+        options: {
+          userName: process.env.SQLSERVER_USER,
+          password: process.env.SQLSERVER_PASSWORD
+        }
+      },
+      options: {
+        database: process.env.SQLSERVER_DATABASE,
+        encrypt: true,
+        trustServerCertificate: true
+      }
+    };
+
+    const connection = new sql.Connection(config);
+    const rows = [];
+
+    connection.on('connect', err => {
+      if (err) return reject(err);
+
+      const request = new sql.Request(query, (err) => {
+        if (err) reject(err);
+        else resolve(rows);
+        connection.close();
+      });
+
+      request.on('row', columns => {
+        const row = {};
+        columns.forEach(col => row[col.metadata.colName] = col.value);
+        rows.push(row);
+      });
+
+      connection.execSql(request);
+    });
+
+    connection.connect();
+  });
+}
+
+server.tool(
+  'sql_query',
+  { query: 'string' },
+  async ({ query }) => {
+    if (!/^select/i.test(query.trim())) {
+      return { content: [{ type: 'text', text: 'Only SELECT queries are allowed.' }] };
+    }
+    const rows = await runQuery(query);
+    return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
+  }
+);
+
+server.tool(
+  'sql_get_tables',
+  {},
+  async () => {
+    const query = `
+      SELECT TABLE_SCHEMA, TABLE_NAME
+      FROM INFORMATION_SCHEMA.TABLES
+      WHERE TABLE_TYPE = 'BASE TABLE'
+      ORDER BY TABLE_SCHEMA, TABLE_NAME
+    `;
+    const rows = await runQuery(query);
+    return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
+  }
+);
+
+server.tool(
+  'sql_get_schema',
+  { table: 'string' },
+  async ({ table }) => {
+    const query = `
+      SELECT COLUMN_NAME, DATA_TYPE
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_NAME = '${table.replace(/'/g, "''")}'
+      ORDER BY ORDINAL_POSITION
+    `;
+    const rows = await runQuery(query);
+    return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
+  }
+);
+
 app.get('/', (req, res) => {
   res.json({
     status: 'Novarpt SQL MCP Ready ✅',
-    database: process.env.SQLSERVER_DATABASE,
     tools: ['sql_query', 'sql_get_tables', 'sql_get_schema']
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Novarpt MCP SQL sur http://localhost:${PORT}`);
-  console.log('Test: http://localhost:' + PORT);
+app.post('/mcp', async (req, res) => {
+  const transport = new StreamableHTTPServerTransport({
+    sessionId: undefined
+  });
+
+  await server.connect(transport);
+  await transport.handleRequest(req, res, req.body);
 });
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`Running on ${PORT}`));
